@@ -1,13 +1,13 @@
 # Denbar 两端串流集成设计
 
-日期：2026-10-27。服务端采用用户已确认的 C++23 + Sunshine 轻量 Fork；客户端直接集成到 denbar-shell。本文定义一期局域网的实现边界，并保留二期厂商 SDK 接入点。硬件性能需要独立验收，仓库准备完成不代表串流功能已经实现。
+日期：2026-10-27，修订 2。服务端采用用户已确认的 C++23 + Sunshine 轻量 Fork；客户端直接集成到 denbar-shell，生产链路采用 moonlight-common-c + MPP。Qt 合成与 DRM/KMS 视频/UI 双图层在一期开始时并列验证。本文定义一期局域网的实现边界，并保留二期厂商 SDK 接入点。硬件性能需要独立验收，仓库准备完成不代表串流功能已经实现。
 
 ## 1. 项目与基线
 
 | 项目 | 位置 | 基线与职责 |
 | --- | --- | --- |
 | denbar-stream | `E:/VisualStudioProjects/denbar-stream`；GitHub `TangChengLin/denbar-stream` | Sunshine Fork；C++23；Windows x64 采集、编码、发送、输入注入及管理 |
-| denbar-shell | `E:/QtProjects/denbar-shell`；原 Cursor 远程 | Qt Quick 6.8.3、C++17、Linux ARM64；接收、MPP 解码、音频、Qt 呈现、外设与现有 UI |
+| denbar-shell | `E:/QtProjects/denbar-shell`；原 Cursor 远程 | Qt Quick 6.8.3、C++17、Linux ARM64；common-c 接收、MPP 解码、音频、视频呈现、外设与现有 Qt UI |
 
 本次源码核对基线：Sunshine `d0b4a88ef727f8dabf80cc970a14739b55c885de`；denbar-shell 本地 master `214abf23acda2960bc05dd63bbaf020bd5a5fa2f`。客户端 origin fetch 在本轮因 SSH 公钥认证失败；本地 origin/master 与 master 相同，但不能据此声称远程最新。
 
@@ -31,7 +31,17 @@
 | Sunshine 轻量 Fork | 能维护实际编码选择、诊断、安装及兼容补丁；承担上游合并成本 | 用户已选 |
 | 重写 Windows 采集、编码、传输栈 | 可控范围大，重复实现配对、输入、丢包恢复和设备兼容 | 不选 |
 
-客户端采用仓内 Moonlight 协议适配 + 共享 MPP/音频/Qt 呈现，不另建客户端仓库。视频与 Qt 界面由同一个显示系统合成；不启动抢占显示的独立 KMS 播放器。
+客户端采用仓内 MoonlightHostClient + moonlight-common-c + MPP，协议、解码和呈现分离，不另建客户端仓库。common-c 提供串流核心，主机配对、应用发现和 launch/resume 仍由客户端适配层承担。两种呈现方案均保留现有 Qt UI，并由唯一显示管理者协调。
+
+| 客户端组件/路线 | 用途与取舍 | 决策 |
+| --- | --- | --- |
+| common-c + 直接 MPP | 接入现有会话/输入/UI；显式控制解码缓冲、同步和生命周期 | 生产主链路，用户已确认 |
+| Qt GPU 合成 | MPP DMA-BUF 导入 EGLImage 后进入 Qt 场景图，便于现有菜单、透明和效果参与合成 | 前置验证，是否达标以真板结果决定 |
+| DRM/KMS 视频/UI 双图层 | 视频 DMA-BUF 直上 video plane，Qt 输出 ARGB UI plane；可能减少 GPU 视频合成，但需要显示平台集成 | 与 Qt 合成同时前置验证，不等后期性能失败再开始 |
+| moonlight-embedded | 独立运行的协议、MPP/DRM 播放对照，帮助区分服务器/解码/Qt 集成问题 | 仅测试工具；不嵌套进 denbar-shell，不作为生产播放器 |
+| ffmpeg-rockchip | 封装 MPP 和 DRM_PRIME，适合独立多媒体管线；此项目暂不需要额外封装层 | 暂不纳入客户端生产依赖，也不新增其 submodule |
+
+直接使用 MPP 不等于天然比 FFmpeg 封装少一帧延迟；双图层也不等于天然实现 240fps。两者都必须测吞吐、排队、同步和实际呈现，不能仅凭 API 路径宣布“零拷贝达标”。
 
 ## 4. 总体链路
 
@@ -42,10 +52,17 @@ flowchart LR
   E --> M[Moonlight 协议与 LAN]
   M --> B[denbar-shell MoonlightBackend]
   V[二期厂商 WebRTC SDK] --> A[VendorSdkBackend]
-  B --> D[MPP 视频解码 / Opus 音频解码]
+  B --> D[共享 MPP 解码与帧所有权]
   A --> D
-  D --> Q[Qt Quick 视频节点 + 现有菜单提示]
-  Q --> O[显示与音频输出]
+  D --> P[IVideoPresenter]
+  P --> Q[Qt GPU 合成]
+  P --> K[DRM video plane + Qt UI plane]
+  U[现有菜单 / 提示 / 前后台交互] --> Q
+  U --> K
+  Q --> O[唯一显示管理者 / 上屏]
+  K --> O
+  B --> AU[共享音频适配 / SDL 输出]
+  A --> AU
   I[键盘 鼠标 手柄] --> R[输入所有权路由]
   R --> B
   R --> A
@@ -130,11 +147,28 @@ TV/PC 形态切换会重启进程，与“返回桌面”不同。活动流切�
 
 所有接入层输出完整编码 access unit、codec、参数集/配置、时间戳、关键帧标识和缓冲所有权。SDK 回调返回后可能失效的内存必须在返回前复制或持有厂商允许的引用，不保存悬空指针。RTP 包、NAL 片段和完整帧不能混用。
 
-MPP 独立解码线程；info-change 时重新分配/确认缓冲组；按 MPP/DPB 要求管理引用，不把整个解码池限制成两张。压缩队列有界，溢出或损坏时请求关键帧并重同步，不任意删除参考帧。显示候选采用容量 2、最新优先；GPU 使用中的帧保持引用直到同步完成，不能被解码器覆写。
+MPP 独立解码线程；info-change 时重新分配/确认缓冲组；按 MPP/DPB 要求管理引用，不把整个解码池限制成两张。压缩队列有界，溢出或损坏时请求关键帧并重同步，不任意删除参考帧。显示候选采用容量 2、最新优先；GPU 或显示控制器使用中的帧保持引用直到相应使用完成，不能被解码器覆写。
 
-首发视频路径为 MPP DMA-BUF → BSP 支持的 EGLImage 导入 → 自定义 Qt Quick OpenGL/GLES 节点/材质 → 单一显示管理者。校验 NV12 格式、stride、modifier、色彩范围/矩阵、同步和析构线程；不把 NV12 当普通 RGBA 纹理包装。目标无 CPU 逐帧 YUV→RGB 和 QImage 上传，但存在 GPU 合成开销。
+共享 `DecodedFrame` 包含 generation、frameId、时间戳、尺寸/裁剪、fourcc、每平面 fd/stride/offset、modifier、色彩矩阵/范围、可用的 acquire 同步和资源 lease。资源由引用与同步共同约束；不能只传一个 fd。`IVideoPresenter` 接收帧、处理激活/停放/恢复并报告提交或已呈现证据，Moonlight 和未来厂商 SDK 不感知呈现实现。
 
-实际 QPA、EGL 扩展和显示模式在板端探测后写入部署清单：已有 Wayland 时 compositor 唯一拥有 KMS；EGLFS 时由 Qt 平台集成拥有显示。不得自行在普通 QML Item 里竞争同一 CRTC。若 Qt 合成不能达到 240，进入统一显示管理者的 video/UI plane 优化评估；不能移除用户要求的叠层来宣布达标。
+前置验证两条真实板端路径，先做可独立运行的最小验证程序，再将通过的路径产品化；不等待完整会话、配对和 C5 产品组件完成：
+
+| 路径 | 数据流 | 必须证明的条件 |
+| --- | --- | --- |
+| `qt-composite` | MPP DMA-BUF → EGLImage → Qt Quick OpenGL/GLES 材质 → Qt 窗口 | 可导入实际 fourcc/modifier；正确 YUV 色彩；真实菜单/提示/效果参与合成；GPU 完成前持帧；实测帧率、延迟和 GPU/内存带宽 |
+| `drm-planes` | MPP DMA-BUF → DRM framebuffer/video plane；Qt 渲染 → ARGB UI plane；同一显示管理者提交 | 实际 CRTC/plane 的格式、modifier、alpha、z-order、缩放、带宽及 atomic test/commit 通过；Qt UI 透明正确；视频和 UI 不互相覆盖；输入焦点与停放/恢复正确 |
+
+两条路径先以线性 NV12 作为兼容候选，实际可用格式以 MPP 输出和 EGL/KMS 共同支持为准；不强开 AFBC/RFBC，不把 Rockchip RFBC 当作 ARM AFBC。压缩格式不被消费端支持时，显式选择已验证的线性输出或报告不支持；任何 RGA/格式转换或额外复制都单独记录成本，不能藏在“零拷贝”指标中。目标是无 CPU 逐帧 YUV→RGB 和 QImage 上传，并不声称完全没有编码数据复制或 GPU 合成。
+
+实际 QPA、EGL 扩展和显示模式在板端探测后写入部署清单。已有 Wayland 时 compositor 唯一拥有 KMS，双图层必须通过 compositor 已验证的 plane 分配能力或明确的平台扩展实现；EGLFS 时由 Qt 平台集成协调两个 plane，必要时开发单独的设备集成插件。只开启 EGLFS atomic 模式不会自动得到双图层。不得在普通 QML Item、独立播放器或第二个 DRM master 中竞争同一 CRTC，也不能靠固定 `/dev/dri/card0`、plane id 或 zpos 猜测硬件。
+
+Qt 合成路径需等 GPU 读取结束才释放源帧；KMS 路径需保持当前 scanout 帧，直到后续替换/禁用提交完成后才释放。提交成功或该帧第一次 page-flip 不能作为释放当前 scanout 的依据。报告区分 submitted、compositor/KMS presented 和物理显示；无可信回执时保留 unknown。
+
+返回本地桌面时，Qt 路径隐藏视频节点，双图层路径由同一 owner 禁用视频 plane 并等待退役，不能只停止提交而留下旧视频遮挡桌面；Qt 桌面/UI继续正常显示。接收与解码仍持续，恢复时只提交最新可用帧。形态切换则进一步完成整个显示资源停放，失败不启动竞争进程。
+
+Qt UI 若需要对视频做实时背景模糊，外部 video plane 不会自动成为 Qt 取样源。保留现有菜单与效果契约：先核对实际取样关系，确需视频背景时使用受控的 Qt 合成回退或经验证的 GPU 共享取样；必须测切换帧连续性和代价。不得悄悄取消模糊/透明、冻结背景或隐藏菜单来宣称达标。
+
+选择规则由本设计确定：同一 BSP、码流、模式和 UI 场景分别测两条路径。两条均满足目标时优先维护成本较低的 Qt 合成；仅双图层满足时选择双图层并承担显示集成维护；两条均未满足时记录 240 未通过，低档只继续联调。选定后写入 `presentation-baseline.json`，包括 QPA、显示 owner、backend、格式、依赖指纹和资格报告；构建/部署不静默切换。生产只强制交付选定路径及其必要回退，不强制维护两个完整播放器。
 
 GameStageLayer 保持 overlayHost 与提示/菜单层，替换视频底层；fixture 模式仍可显示 PosterImage。PointerShield 与输入过滤协同，避免视频点击穿透桌面，同时不吞掉远端应收到的鼠标。
 
@@ -148,6 +182,34 @@ InputRouter 管 UI，StreamingInputRouter 管远端；InputOwnership 为 Local/R
 
 SettingsVM 增加 1440p 和 240fps，并区分请求档位、协商档位、实测吞吐与输出刷新率。用户请求超出能力时明确提示，不静默把 120 冒充 240。帧率/丢包 OSD 统计真实层级；UI 统计更新限频到 2Hz，不按 240Hz 更新 QML 文本。
 
+### 6.5 依赖固定与 submodule 管理
+
+下表是后续实施时的依赖策略；本次仅更新设计和计划，没有给客户端添加 submodule、安装 MPP 或构建测试工具。“候选固定提交”用于开始可复现的集成，不等于已经通过 RK3576 性能验收。
+
+| 依赖 | 固定版本/来源 | 管理与发布规则 |
+| --- | --- | --- |
+| Sunshine 服务端 | `d0b4a88ef727f8dabf80cc970a14739b55c885de` 开发基线 | 整仓轻量 Fork；沿用该父提交的全部递归 gitlink，现有 47 个已初始化；不是把 Sunshine 再作为服务器 submodule |
+| 客户端 moonlight-common-c | 初始候选 `04053843c90c4268583f2496b997d54d59f03957`，与已克隆服务器中的版本一致 | 必选 submodule：`third-party/moonlight-common-c`；嵌套 enet=`aca87840b57f045a1f7f9299e4b1b9b8e2a5e2f1`、nanors=`b1e3c22ca0cdc0bb83e3cd6ed1a2fc77869ed99a`；递归初始化并记录实际树 |
+| Rockchip MPP | 优先目标板 BSP 配套的头文件、`librockchip_mpp` 和内核驱动组合；确切版本尚待真板提取 | 默认 `DENBAR_MPP_PROVIDER=system`，由冻结的目标 sysroot/部署包供给，不新增 submodule；锁定包版本、源码提交（可获得时）、构建选项和库/头文件 SHA-256。缺少这些证据不得标记生产基线完成 |
+| 自行构建 MPP（仅确有需要） | 从已验证兼容该 BSP 的提交派生，提交号在引入前写入锁文件 | 互斥选项 `DENBAR_MPP_PROVIDER=source`；可选 submodule `third-party/rockchip-mpp`。只链接/部署一种 MPP，不覆盖系统库、不混用新版头文件和旧运行库；与现有 libmpv 等共享依赖存在冲突时先解决后启用 |
+| Qt | 精确 `6.8.3`，保留现有版本断言 | 沿用现有工具链；额外固定 Qt 构建配置、QPA/设备集成插件及补丁哈希；不再嵌一份 Qt 源码 submodule |
+| libdrm、GBM/EGL/GLES、Mali、内核/DTB/固件 | 与 BSP 和已选 QPA 配套的确切包/镜像 | 用 sysroot/镜像摘要、包版本和文件哈希固定，不能独立自动升级到 latest；不批量引为源码 submodule |
+| libopus、现有 SDL2、主机控制所需 TLS 库 | C0 提取目标环境精确版本，C3/C6 固定新增包来源及哈希 | 复用项目包/工具链机制并纳入锁文件，不重复拉 SDL 事件循环或无目的添加源码仓库 |
+| moonlight-embedded | 测试候选 `f32e415aea6797d261d6b470dcf8bf18727341c2` | 可选测试 submodule：`tools/streaming/reference/moonlight-embedded`，递归依赖跟随其父 gitlink；独立构建/进程，默认产品构建和安装包排除，不链接其 `libmoonlight-rk.so`；它自己的 common-c 不与产品 common-c 混链 |
+| ffmpeg-rockchip | 不选生产版本 | 暂不增加 submodule、链接或部署依赖；后续若需要先修改设计并验证。此决定不删除 Sunshine 既有 FFmpeg 或客户端现有 libmpv/FFmpeg 依赖 |
+
+上游 MPP `20959ec3dabb313b8c33ca0b7b09c06ffd2a9caa` 的 RK3576 SoC 表仅作为源码研究依据，不是目标板生产版本。SDK 和 BSP 未提供的真实版本不得填成该研究提交或“最新”。
+
+客户端 C0 建立 `toolchain/streaming/dependencies.lock.json`，schemaVersion=1。每项记录 role（production/reference）、provider（submodule/package/bsp）、repository/commit 或包版本与 SHA-256、许可证来源、构建选项和 qualification 状态；板端部分记录 BSP/内核/sysroot/Qt/QPA/MPP 实际加载库。`sourceCommit` 不可得时明确 unknown，仍须有不可变的包/镜像和文件哈希，不能伪造来源。开发待取证项可以显式 unresolved，但发布检查拒绝生产项 unresolved。服务器 S1 独立记录本端依赖清单；两端通过 runId 和清单摘要关联，不共享 C++ ABI 或强求全部依赖同版本。
+
+submodule 规则：
+
+1. `.gitmodules` 记录官方 HTTPS URL，父仓 gitlink 固定完整提交；子模块工作树保持干净，不用移动分支/tag 作为发布锁，不在常规构建执行 `git submodule update --remote` 或联网拉 latest。
+2. 客户端生产初始化按路径执行 `git submodule update --init --recursive third-party/moonlight-common-c`；选择 source MPP 时才初始化其路径。对照工具另行显式初始化其路径，默认构建/打包不依赖它。服务器按上游树初始化全部既有子模块。
+3. CI/发布检查所需路径的 `git submodule status --recursive`，拒绝未初始化、偏离或冲突状态，并核对锁文件；自有补丁放在依赖 Fork 的可获取提交，或维护有校验的补丁集，不依赖未提交修改。
+4. 升级在独立 `codex/deps-*` 分支进行；服务器同步上游用 `codex/sync-sunshine-*`。一次只推进有明确目的的依赖组，提交 gitlink、锁文件、兼容报告和回退点；不得仅因服务器升级就强制同步客户端 common-c。
+5. common-c 升级重跑配对/协议/AU/输入/重连；MPP/BSP/Qt/DRM 升级重跑 G0 双路径和 G3；工具升级重建对照基线。发布保持源码来源、许可证和第三方声明，回退恢复上一组 gitlink、包/镜像及其资格记录。
+
 ## 7. 二期接口边界
 
 VendorSdkBackend 实现与 MoonlightBackend 相同的会话/媒体契约；公网拥塞控制、ICE/TURN/DTLS/SRTP 由厂商 SDK 负责。客户端不再叠一套 WebRTC jitter buffer，也不自行假设 SDK 提供标准 libwebrtc VideoDecoderFactory。
@@ -156,9 +218,9 @@ VendorSdkBackend 实现与 MoonlightBackend 相同的会话/媒体契约；公�
 
 ## 8. 验收与分阶段门禁
 
-G0 板端：记录板卡型号/BSP/内核/MPP/Qt/QPA、显示接口、线材、EDID 和 1440p240 模式；离线 HEVC 硬解；带真实 Qt 菜单叠层呈现。未通过时明确目标未达，较低档仅用于继续软件联调。
+G0 板端前置门禁：先冻结真实板卡/BSP/依赖指纹和显示链路，再用同一离线 HEVC 动态帧号码流分别验证 `qt-composite` 与 `drm-planes`，覆盖菜单关闭/打开、提示、视频背景效果、返回桌面/恢复和资源释放；比较吞吐、帧间隔、排队、CPU/GPU/内存带宽、温度及可测的呈现时延。固定唯一显示 owner 和选择报告后进入呈现产品化。moonlight-embedded 在测试窗口独立对照，运行前通过受控步骤停放/停止占用同一显示的 Shell，结束后恢复；不能与其争夺 KMS，也不能用无 UI 的对照结果替代产品资格。
 
-G1 服务端：固定源码和依赖；UHD730、RTX30、RTX50 分别记录精确型号、驱动、显示、实际 encoder；标准 Moonlight 配对/播放/输入作为对照；严格编码选择和单会话竞争测试通过。
+G1 服务端：固定源码和依赖；UHD730、RTX30、RTX50 分别记录精确型号、驱动、显示、实际 encoder；标准桌面 Moonlight 配对/播放/输入作为服务端对照，RK3576 moonlight-embedded 作为板端对照，denbar-shell 作为产品验收，三者证据分列；严格编码选择和单会话竞争测试通过。
 
 G2 客户端：状态机、取消/迟到回调、证书校验、码流恢复、缓冲生命周期、输入路由、预算和既有交互测试通过；无 GPU 测试不能替代 MPP/上屏验收。
 
@@ -170,13 +232,20 @@ G3 整机：动态帧号测试源验证真实不同帧，分别测捕获/编码/
 
 ## 9. 尚需实施阶段取证的项目
 
-板卡具体型号/显示接线/BSP、真实 QPA 与 DMA-BUF 能力，通过 G0 实测锁定；厂商 SDK 细节在二期接入前锁定。它们不阻止仓库准备、纯逻辑开发和计划编制，但阻止对应性能/功能的通过声明。
+板卡具体型号/显示接线/BSP、真实 QPA 与 DMA-BUF/plane 能力、实际 MPP 等包版本，通过 G0 实测锁定；厂商 SDK 细节在二期接入前锁定。两种呈现路径的选择、MPP provider 及尚未知的板端版本只能在证据齐全后冻结。它们不阻止计划、协议与纯逻辑开发，但阻止呈现方案定版和对应性能/功能的通过声明。
 
 ## 10. 参考依据
 
 - [Sunshine 开发基线](https://github.com/LizardByte/Sunshine/tree/d0b4a88ef727f8dabf80cc970a14739b55c885de)
 - [Sunshine 构建说明](https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2building.html)
-- [Moonlight common-c](https://github.com/moonlight-stream/moonlight-common-c)
-- [Rockchip MPP](https://github.com/rockchip-linux/mpp)
+- [Moonlight common-c 初始固定候选](https://github.com/moonlight-stream/moonlight-common-c/tree/04053843c90c4268583f2496b997d54d59f03957)
+- [moonlight-embedded 对照版本及 RK/DRM 实现](https://github.com/moonlight-stream/moonlight-embedded/blob/f32e415aea6797d261d6b470dcf8bf18727341c2/src/video/rk.c)
+- [MPP RK3576 SoC 表（研究版本）](https://github.com/rockchip-linux/mpp/blob/20959ec3dabb313b8c33ca0b7b09c06ffd2a9caa/osal/mpp_soc.c)
+- [ffmpeg-rockchip 编译说明（仅研究）](https://github.com/nyanmisaka/ffmpeg-rockchip/wiki/Compilation)
+- [Qt 6.8 Embedded Linux / DRM API](https://doc.qt.io/qt-6.8/embedded-linux.html#drm-api-selection)
+- [Linux DRM master 与显示所有权](https://docs.kernel.org/gpu/drm-uapi.html#primary-nodes-drm-master-and-authentication)
+- [Linux DRM/KMS atomic 与同步](https://docs.kernel.org/gpu/drm-kms.html)
+- [Qt ShaderEffectSource 的 sourceItem 取样语义](https://doc.qt.io/qt-6.8/qml-qtquick-shadereffectsource.html)
+- [EGL DMA-BUF 导入扩展](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt)
 - [RK3576 官方规格](https://www.rock-chips.com/uploads/pdf/2024.3.18/191/RK3576%20Brief%20Datasheet.pdf)
 - 客户端 AGENTS.md、docs/handover.md，以及本设计第 1 节固定基线的 QML/C++ 源码。

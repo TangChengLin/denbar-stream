@@ -4,7 +4,7 @@
 
 **Goal:** 在 Sunshine 轻量 Fork 上交付可诊断、可更新、严格硬编选择且单活动流的 Windows LAN 服务端，与标准 Moonlight 及 denbar-shell 联通。
 
-**Architecture:** 复用 Sunshine 捕获、编码、协议、音频和输入。Denbar 只增加 profile、admission 与诊断模块，配置复用原有 Web 管理认证及现有部署方式。发布资格由真实设备测试决定。
+**Architecture:** 复用 Sunshine 捕获、编码、协议、音频和输入。Denbar 只增加 profile、admission 与诊断模块，配置复用原有 Web 管理认证及现有部署方式。客户端生产使用common-c + MPP，前置比较Qt合成与DRM视频/UI双图层；服务器保持同一Moonlight协议，以三类客户端对照和真实设备测试确认资格。
 
 **Tech Stack:** C++23、MSYS2 UCRT64、CMake/Ninja、上游 Qt/Vue、gtest；Quick Sync/NVENC。
 
@@ -19,6 +19,8 @@
 - capture 基线 `ddx`；encoder 为 `quicksync` 或 `nvenc`；硬件失败不得静默软件回退。
 - 遵循 AGENTS.md：测试包含 tests_common.h、修改方法有回归、Doxygen 与 clang-format；构建配置变更只做配置/构建检查，不编造测试工程。
 - 未经设备验证不得发布性能结论；本计划未执行的步骤保持未勾选。
+- 依赖固定遵循设计6.5：保留Sunshine父提交及全部递归gitlink；服务器既有FFmpeg等依赖不因客户端排除ffmpeg-rockchip而删除。
+- 标准桌面Moonlight、RK3576 moonlight-embedded测试工具、denbar-shell生产客户端分别记录；工具播放成功不能代替带Qt菜单/提示的产品验收。
 
 ## Review Focus
 
@@ -55,15 +57,17 @@
 
 定向测试在最后一条追加 `--gtest_filter=DenbarProfile.*` 等本文测试组。先观察新增用例因缺少行为失败，再实现，再全组通过；不把编译错误当唯一行为验证。测试构建带覆盖率开销，性能验收另用 Release、BUILD_TESTS=OFF 的 `cmake-build-denbar-release`。
 
-## S1 固定可复现基线并完成标准客户端对照
+## S1 固定可复现基线并建立服务端与板端对照
 
-**Files:** 新增 `docs/denbar/build-baseline.md`、`docs/denbar/validation/host-inventory.json`；必要时修改 `cmake/prep/options.cmake` 的发布者配置入口，不改语言标准。
+**Files:** 新增 `docs/denbar/build-baseline.md`、`docs/denbar/dependencies.lock.json`、`docs/denbar/validation/host-inventory.json`；必要时修改 `cmake/prep/options.cmake` 的发布者配置入口，不改语言标准。
 
-**Interfaces:** 输出固定源码/全部子模块/工具链清单、服务启动方式、首台主机实际捕获与编码结果；后续任务沿用这份基线。
+**Interfaces:** 输出固定源码/全部子模块/工具链清单、服务启动方式、首台主机实际捕获与编码结果；后续任务沿用这份基线。服务器锁文件schemaVersion=1，记录父commit、全部递归gitlink、MSYS2包/编译器/CMake/Ninja及上游Qt/FFmpeg等包版本、构建选项、包/产物SHA-256与许可证来源；不强求与客户端依赖版本相同。
 
 - [ ] 核对 master 与开发分支、子模块无未初始化/偏离；清单包含 Windows 版本、GPU精确型号、驱动、显示模式、输入驱动和上游提交。
+- [ ] 固定当前47个递归子模块的gitlink与包清单；保留可恢复的依赖包/工具链来源，不在构建自动update --remote或升级MSYS2包。服务器common-c现为 `04053843c90c4268583f2496b997d54d59f03957`，只是客户端初始候选的来源，不要求后续两端每次同步升级。
 - [ ] 按官方工具链配置、构建、运行现有 test_sunshine；保存命令、退出码及失败详情。上游既有失败单独定位，不能通过关闭测试假装成功。
 - [ ] 用原有配置界面完成凭据、配对及 Desktop 应用确认；标准 Moonlight 跑通 1080p60 图像、音频与输入，记录实际编码器。
+- [ ] 提供同一HEVC动态帧号测试源、codec/profile/level/码率和服务器日志给客户端C0b；板端工具就绪后补记moonlight-embedded固定版本的联网对照。桌面客户端对照完成即可推进S2/S3和客户端C3，不让可选工具或未完成的产品客户端阻塞服务器基线。
 - [ ] 以 `docs: record Denbar server baseline` 提交可审查的配置说明；不得提交密码、证书、设备个人信息或构建产物。
 
 ## S2 实现 profile schema、配置事务与能力导出
@@ -118,16 +122,17 @@
 
 **Files:** 新增 `docs/denbar/validation/lan-matrix.md`、`docs/denbar/validation/result.schema.json`、`tools/denbar/collect-session-report.ps1`；诊断所需采样扩展 `src/denbar/diagnostics.*` 及对应测试。
 
-**Interfaces:** 与客户端计划 C9 使用同一 runId；报告含硬件/源码/配置指纹、请求和实际参数、distinctFrames/duplicates/drops、阶段耗时及采样定义。p95/p99需明确样本集合，不能从min/max/avg推算。
+**Interfaces:** 与客户端计划 C9 使用同一 runId；报告含硬件/源码/配置指纹、两端依赖锁文件摘要、客户端类别及版本、presenter backend/QPA/owner/fourcc/modifier、请求和实际参数、distinctFrames/duplicates/drops、阶段耗时及采样定义。p95/p99需明确样本集合，不能从min/max/avg推算。标准客户端无法提供的指标保持unknown，不能把其提交fps当物理上屏fps。
 
 - [ ] 测试统计窗口、重复帧不计新帧、乱序/时钟回拨不生成负延迟；实现报告与客户端可关联的标识。
-- [ ] 分别验证UHD730、具体RTX30型号、具体RTX50型号；每种记录标准Moonlight与denbar-shell结果，硬件未到列待测。
+- [ ] 分别验证UHD730、具体RTX30型号、具体RTX50型号；每种分列标准桌面Moonlight、RK3576 moonlight-embedded和denbar-shell结果；工具失败/未运行标明原因，硬件未到列待测。不能用对照工具结果替代生产客户端结果。
 - [ ] 按设计G3执行30分钟动态帧号、2小时热稳态、100次前后台和20次断线；带实际Qt叠层测240与输入到光子，禁用测试覆盖率开销。
+- [ ] 核对客户端C0b双呈现比较与C5选定路径，覆盖真实菜单、剩余时长提示、背景效果及返回/恢复；路径包含合成回退时也纳入资格，不只测关闭UI的直出性能。服务器profile保持codec/模式权威，不通过改线协议控制客户端plane。
 - [ ] 仅把匹配硬件指纹且通过的组合加入allowedModes已验证清单；失败保留证据，低档通过不能代替240。
-- [ ] 固定发布commit/tag和依赖、报告、回退版本；提交 `docs: record Denbar LAN qualification`。
+- [ ] 固定发布commit/tag和依赖、报告、回退版本；核对上游更新未隐式移动gitlink或包版本，MPP/BSP/Qt/DRM变化后的旧客户端资格不可直接复用。提交 `docs: record Denbar LAN qualification`。
 
 ## 实施顺序与自查
 
-S1→S2/S3→S4→S5→S6；S2的配置提交依赖S4事务接口，可先用fake完成纯逻辑，发布前必须联调。客户端C0可与S1并行；S1提供标准客户端对照后客户端C3开始真实联调；S6依赖客户端C9。
+S1→S2/S3→S4→S5→S6；S2的配置提交依赖S4事务接口，可先用fake完成纯逻辑，发布前必须联调。客户端C0a/C0b离线双路径与S1并行；S1提供标准桌面客户端对照后客户端C3开始真实联调，板端工具对照就绪后补齐；S6依赖客户端C9以及C0b选择报告。
 
-覆盖检查：profile权威(S2/S4)、硬件选择(S3)、单会话及失败释放(S4)、原生采集/协议复用(S1)、部署回退(S5)、实际240与上游同步发布(S6)。接口名称和类型以上述契约为准；新增需求先更新设计，避免在任务中偷换协议或目标。
+覆盖检查：profile权威(S2/S4)、硬件选择(S3)、单会话及失败释放(S4)、原生采集/协议复用/依赖固定/分层对照(S1)、部署回退(S5)、双端指纹与带UI实际240/上游同步发布(S6)。接口名称和类型以上述契约为准；本次为修订2文档更新，未改服务器产品代码或既有子模块，实施步骤保持未勾选。
